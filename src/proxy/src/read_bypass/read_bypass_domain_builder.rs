@@ -136,25 +136,26 @@ impl<S: ProxyStream> ReadBypassDomainBuilder<S> {
         shutdown: ShutdownHandle,
         s3_client: S3Client,
     ) -> Self {
-        let config_cache_enabled = proxy_config
+        let server_cache_enabled = channel_init_config.read_bypass_config.readahead_cache_enabled;
+        let local_cache_enabled = proxy_config
             .nested_config
             .read_bypass_config
             .readahead_cache_enabled;
+        let has_memory = has_sufficient_memory_for_readahead_cache();
 
-        if config_cache_enabled {
-            info!("Readahead caching is disabled in current version, disabling");
-        }
-        let cache_enabled = false;
+        let cache_enabled = server_cache_enabled && local_cache_enabled && has_memory;
 
-        let cache_enabled = if cache_enabled && !has_sufficient_memory_for_readahead_cache() {
+        if !has_memory && server_cache_enabled && local_cache_enabled {
             info!(
                 "Readahead cache disabled due to insufficient system memory (requires >= {} GiB)",
                 crate::utils::MIN_MEMORY_FOR_READAHEAD_GIB
             );
-            false
-        } else {
-            cache_enabled
-        };
+        }
+
+        info!(
+            "Readahead cache: server_cache_enabled={}, local_cache_enabled={}, has_memory={}, cache_enabled={}",
+            server_cache_enabled, local_cache_enabled, has_memory, cache_enabled
+        );
 
         let read_bypass_context = Arc::new(ReadBypassContext::new(
             &proxy_config,
@@ -193,8 +194,9 @@ mod tests {
         )
         .await;
 
-        // Verify cache is disabled (hardcoded off in current version)
-        assert!(!builder.read_bypass_context.cache_enabled);
+        // Cache enabled depends on system memory (requires >= 30 GiB)
+        let expected_cache_enabled = crate::utils::has_sufficient_memory_for_readahead_cache();
+        assert_eq!(builder.read_bypass_context.cache_enabled, expected_cache_enabled);
 
         let (tx, _rx) = mpsc::channel(10);
 
@@ -207,5 +209,46 @@ mod tests {
         let reader_guard = reader.try_lock();
         assert!(reader_guard.is_ok());
         assert_eq!(reader_guard.unwrap().get_domain(), READ_BYPASS_DOMAIN_NAME);
+    }
+
+    async fn build_with_cache_settings(
+        server_enabled: bool,
+        local_enabled: bool,
+    ) -> ReadBypassDomainBuilder<TcpStream> {
+        let mut config = ProxyConfig::default();
+        config.nested_config.read_bypass_config.readahead_cache_enabled = local_enabled;
+
+        let mut channel_config = ChannelInitConfig::default();
+        channel_config.read_bypass_config.readahead_cache_enabled = server_enabled;
+
+        let (shutdown_handle, _waiter) = ShutdownHandle::new(CancellationToken::new());
+        let s3_client = S3Client::default().await;
+
+        ReadBypassDomainBuilder::new(config, channel_config, shutdown_handle, s3_client).await
+    }
+
+    #[tokio::test]
+    async fn test_readahead_cache_both_enabled() {
+        let builder = build_with_cache_settings(true, true).await;
+        let has_memory = crate::utils::has_sufficient_memory_for_readahead_cache();
+        assert_eq!(builder.read_bypass_context.cache_enabled, has_memory);
+    }
+
+    #[tokio::test]
+    async fn test_readahead_cache_server_disabled() {
+        let builder = build_with_cache_settings(false, true).await;
+        assert!(!builder.read_bypass_context.cache_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_readahead_cache_local_disabled() {
+        let builder = build_with_cache_settings(true, false).await;
+        assert!(!builder.read_bypass_context.cache_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_readahead_cache_both_disabled() {
+        let builder = build_with_cache_settings(false, false).await;
+        assert!(!builder.read_bypass_context.cache_enabled);
     }
 }

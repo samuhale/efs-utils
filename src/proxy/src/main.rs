@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[allow(clippy::all)]
+#[allow(dead_code)]
 #[allow(deprecated)]
 #[allow(invalid_value)]
 #[allow(non_camel_case_types)]

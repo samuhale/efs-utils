@@ -2,7 +2,7 @@ use log::warn;
 
 use crate::{
     awsfile_prot::{
-        AwsFileChannelInitRes, AwsFileChannelInitResOK, AwsFileReadBypassConfigRes,
+        AwsFileChannelInitRes, AwsFileChannelInitResOK, AwsFileReadBypassConfigResV2,
         ChannelConfigRes,
     },
     error::RpcError,
@@ -13,6 +13,7 @@ pub struct ReadBypassConfig {
     pub enabled: bool,
     pub bucket_name: String,
     pub prefix: String,
+    pub readahead_cache_enabled: bool,
 }
 
 impl Default for ReadBypassConfig {
@@ -21,14 +22,15 @@ impl Default for ReadBypassConfig {
             enabled: false,
             bucket_name: String::new(),
             prefix: String::new(),
+            readahead_cache_enabled: false,
         }
     }
 }
 
-impl TryFrom<AwsFileReadBypassConfigRes> for ReadBypassConfig {
+impl TryFrom<AwsFileReadBypassConfigResV2> for ReadBypassConfig {
     type Error = RpcError;
 
-    fn try_from(value: AwsFileReadBypassConfigRes) -> Result<Self, Self::Error> {
+    fn try_from(value: AwsFileReadBypassConfigResV2) -> Result<Self, Self::Error> {
         let bucket_name = String::from_utf8(value.bucket_name).map_err(|_| {
             RpcError::AwsFileChannelInitFailure(String::from("failed to parse bucket_name"))
         })?;
@@ -40,6 +42,7 @@ impl TryFrom<AwsFileReadBypassConfigRes> for ReadBypassConfig {
             enabled: value.enabled,
             bucket_name,
             prefix,
+            readahead_cache_enabled: value.readahead_cache_enabled,
         })
     }
 }
@@ -66,16 +69,19 @@ impl TryFrom<AwsFileChannelInitRes> for ChannelInitConfig {
 
         for config in configs {
             match config {
-                ChannelConfigRes::AWSFILE_READ_BYPASS(config) => match config.try_into() {
+                ChannelConfigRes::AWSFILE_READ_BYPASS_V2(config) => match config.try_into() {
                     Ok(config) => read_bypass_config = config,
                     Err(e) => {
                         warn!(
-                            "Failed to parse ChannelConfigRes::AWSFILE_READ_BYPASS \
+                            "Failed to parse ChannelConfigRes::AWSFILE_READ_BYPASS_V2 \
                             configuration. S3 READ_BYPASS will not be enabled. Error:{:?}",
                             e
                         );
                     }
                 },
+                _ => {
+                    warn!("Received unexpected channel config type, ignoring");
+                }
             }
         }
 
@@ -87,7 +93,7 @@ impl TryFrom<AwsFileChannelInitRes> for ChannelInitConfig {
 mod tests {
     use super::*;
     use crate::awsfile_prot::{
-        AwsFileChannelInitRes, AwsFileChannelInitResOK, AwsFileReadBypassConfigRes,
+        AwsFileChannelInitRes, AwsFileChannelInitResOK, AwsFileReadBypassConfigResV2,
         ChannelConfigRes,
     };
 
@@ -95,11 +101,12 @@ mod tests {
     const TEST_BUCKET_NAME: &str = "test-bucket";
     const TEST_PREFIX: &str = "test-prefix";
 
-    fn get_test_read_bypass_config_res() -> AwsFileReadBypassConfigRes {
-        AwsFileReadBypassConfigRes {
+    fn get_test_read_bypass_config_res_v2(readahead_enabled: bool) -> AwsFileReadBypassConfigResV2 {
+        AwsFileReadBypassConfigResV2 {
             enabled: TEST_ENABLED,
             bucket_name: TEST_BUCKET_NAME.as_bytes().to_vec(),
             prefix: TEST_PREFIX.as_bytes().to_vec(),
+            readahead_cache_enabled: readahead_enabled,
         }
     }
 
@@ -108,53 +115,69 @@ mod tests {
         // Create an empty AwsFileChannelInitResOK with no configs
         let res = AwsFileChannelInitRes::AWSFILE_OK(AwsFileChannelInitResOK { configs: vec![] });
 
-        // Convert to ChannelInitConfig
+        // Convert to ChannelInitConfig and verify default configs are used
         let config = ChannelInitConfig::try_from(res).unwrap();
-
-        // Verify default configs are used
         assert_eq!(ChannelInitConfig::default(), config);
     }
 
     #[test]
-    fn test_read_bypass_config() -> Result<(), RpcError> {
-        // Create a read bypass config
-        let read_bypass_config = get_test_read_bypass_config_res();
+    fn test_read_bypass_config_v2_with_readahead_enabled() -> Result<(), RpcError> {
+        // Create a V2 read bypass config with readahead enabled
+        let read_bypass_config = get_test_read_bypass_config_res_v2(true);
 
-        // Create AwsFileChannelInitResOK with read bypass config
+        // Create AwsFileChannelInitResOK with V2 read bypass config
         let res = AwsFileChannelInitRes::AWSFILE_OK(AwsFileChannelInitResOK {
-            configs: vec![ChannelConfigRes::AWSFILE_READ_BYPASS(read_bypass_config)],
+            configs: vec![ChannelConfigRes::AWSFILE_READ_BYPASS_V2(read_bypass_config)],
         });
 
-        // Convert to ChannelInitConfig
+        // Convert to ChannelInitConfig and verify read bypass config is correct
         let config = ChannelInitConfig::try_from(res)?;
 
-        // Verify read bypass config is correct
         assert_eq!(TEST_ENABLED, config.read_bypass_config.enabled);
         assert_eq!(TEST_BUCKET_NAME, config.read_bypass_config.bucket_name);
         assert_eq!(TEST_PREFIX, config.read_bypass_config.prefix);
+        assert_eq!(true, config.read_bypass_config.readahead_cache_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_bypass_config_v2_with_readahead_disabled() -> Result<(), RpcError> {
+        // Create a V2 read bypass config with readahead disabled
+        let read_bypass_config = get_test_read_bypass_config_res_v2(false);
+
+        // Create AwsFileChannelInitResOK with V2 read bypass config
+        let res = AwsFileChannelInitRes::AWSFILE_OK(AwsFileChannelInitResOK {
+            configs: vec![ChannelConfigRes::AWSFILE_READ_BYPASS_V2(read_bypass_config)],
+        });
+
+        // Convert to ChannelInitConfig and verify readahead is disabled
+        let config = ChannelInitConfig::try_from(res)?;
+
+        assert_eq!(TEST_ENABLED, config.read_bypass_config.enabled);
+        assert_eq!(false, config.read_bypass_config.readahead_cache_enabled);
         Ok(())
     }
 
     #[test]
     fn test_invalid_utf8() -> Result<(), RpcError> {
         // Create a read bypass config with invalid UTF-8
-        let invalid_read_bypass_config = AwsFileReadBypassConfigRes {
+        let invalid_read_bypass_config = AwsFileReadBypassConfigResV2 {
             enabled: true,
             bucket_name: vec![0xFF, 0xFE, 0xFD], // Invalid UTF-8
             prefix: "test-prefix".as_bytes().to_vec(),
+            readahead_cache_enabled: false,
         };
 
         // Create AwsFileChannelInitResOK with invalid read bypass config
         let res = AwsFileChannelInitRes::AWSFILE_OK(AwsFileChannelInitResOK {
-            configs: vec![ChannelConfigRes::AWSFILE_READ_BYPASS(
+            configs: vec![ChannelConfigRes::AWSFILE_READ_BYPASS_V2(
                 invalid_read_bypass_config,
             )],
         });
 
-        // Convert to ChannelInitConfig - should use default for read bypass
+        // Convert to ChannelInitConfig - should use default for read bypass due to parsing error
         let config = ChannelInitConfig::try_from(res)?;
 
-        // Verify read bypass config is default due to parsing error
         assert_eq!(false, config.read_bypass_config.enabled);
         assert_eq!("", config.read_bypass_config.bucket_name);
         assert_eq!("", config.read_bypass_config.prefix);
@@ -163,10 +186,8 @@ mod tests {
 
     #[test]
     fn test_default_error() {
-        // Test with default error response
+        // Test with default error response - should fail
         let res = AwsFileChannelInitRes::default;
-
-        // Convert to ChannelInitConfig - should fail
         let result = ChannelInitConfig::try_from(res);
         assert!(result.is_err());
         assert!(matches!(

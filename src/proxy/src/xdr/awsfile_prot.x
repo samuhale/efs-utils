@@ -61,16 +61,26 @@ struct BindClientResponse {
 };
 
 enum AwsFileChannelConfigTypes {
-        AWSFILE_READ_BYPASS     = 4
+        AWSFILE_READ_BYPASS             = 4,
+        AWSFILE_READ_BYPASS_V2          = 5
 };
 
+/* v1 read bypass config */
 struct AwsFileReadBypassConfigArgs {
         bool        enabled;
+};
+
+/* v2 read bypass config - adds efs_utils_version */
+struct AwsFileReadBypassConfigArgsV2 {
+        bool        enabled;
+        opaque      efs_utils_version<>;
 };
 
 union ChannelConfigArgs switch (AwsFileChannelConfigTypes config_type) {
 case AWSFILE_READ_BYPASS:
         AwsFileReadBypassConfigArgs     read_bypass_config;
+case AWSFILE_READ_BYPASS_V2:
+        AwsFileReadBypassConfigArgsV2   read_bypass_config_v2;
 };
 
 struct AwsFileChannelInitArgs {
@@ -78,15 +88,26 @@ struct AwsFileChannelInitArgs {
         ChannelConfigArgs               configs<>;
 };
 
+/* v1 read bypass response */
 struct AwsFileReadBypassConfigRes {
         bool                            enabled;
         opaque                          bucket_name<>;
         opaque                          prefix<>;
 };
 
+/* v2 read bypass response - adds readahead_cache_enabled */
+struct AwsFileReadBypassConfigResV2 {
+        bool                            enabled;
+        opaque                          bucket_name<>;
+        opaque                          prefix<>;
+        bool                            readahead_cache_enabled;
+};
+
 union ChannelConfigRes switch (AwsFileChannelConfigTypes config_type) {
 case AWSFILE_READ_BYPASS:
         AwsFileReadBypassConfigRes     read_bypass_config;
+case AWSFILE_READ_BYPASS_V2:
+        AwsFileReadBypassConfigResV2   read_bypass_config_v2;
 };
 
 struct AwsFileChannelInitResOK {

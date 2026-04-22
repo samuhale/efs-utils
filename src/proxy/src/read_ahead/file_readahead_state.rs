@@ -203,19 +203,21 @@ impl FileReadAheadState {
         s3_data_reader: Arc<dyn S3DataReader>,
         suppress_readahead: bool,
     ) -> Result<(Option<Bytes>, bool), ReadAheadCacheError> {
-        // We should not read outside of the file size, NFS allows for such request but only
-        // returns data up to EOF
+        // === STEP 1: Validate range ===
+        // Clamp to file size - NFS allows reads past EOF but we return data up to EOF only
         let end = (s3_data_locator.offset + s3_data_locator.count as u64).min(file_size);
         let range = s3_data_locator.offset..end;
 
-        // A read at or past EOF, or zero-length read, returns empty
         if range.start >= range.end {
             return Ok((Some(Bytes::new()), false));
         }
 
         let request_len = (range.end - range.start) as usize;
 
-        // First check if we can serve from cache - collect refs while holding lock
+        // === STEP 2: Optimistic cache check (fast path) ===
+        // Acquire READ lock on data_cache (the index), collect Arc<CachedData> refs.
+        // After dropping lock, we still hold Arc refs - objects can't be deallocated,
+        // but eviction CAN mark them evicted and clear their data.
         let (read_pattern, cached_ranges) = {
             let data_cache_read = self.acquire_read_lock().await?;
             let mut read_pattern = self.recognize_read_pattern(range.clone(), &data_cache_read);
@@ -235,13 +237,18 @@ impl FileReadAheadState {
             )?;
             (read_pattern, cached_ranges)
         };
-        // Lock released - now fetch data (may wait for loading entries)
 
+        // === STEP 3: Read data from Arc refs ===
+        // For each Arc<CachedData>, acquire READ lock on CachedData.data,
+        // copy/reference the bytes, release lock. Returns owned Bytes.
+        // Note: single-chunk reads return Bytes that embed the CachedData.data lock.
         let fetched = self
             .fetch_from_cached_ranges(&read_bypass_request_context, cached_ranges, true)
             .await?;
 
-        // Check if we have full cache hit
+        // === STEP 4: Check for full cache hit ===
+        // If we got all requested bytes, return immediately (fast path success).
+        // If eviction raced and cleared some data, cached_len < request_len.
         let cached_len: usize = fetched.iter().map(|(_, b)| b.len()).sum();
         if cached_len == request_len {
             let result = Self::combine_ranges(fetched, range.clone())?;
@@ -267,9 +274,9 @@ impl FileReadAheadState {
             return Ok((Some(result), false));
         }
 
-        // Data not cached - fetch from S3 with readahead
-        // Drop fetched to release any embedded read guards before S3 fetch,
-        // which may trigger eviction that needs write locks on the same entries.
+        // === STEP 5: Cache miss - fall back to slow path ===
+        // Drop fetched to release any embedded CachedData.data read locks
+        // before S3 fetch, which may trigger eviction needing write locks.
         drop(fetched);
         ctx_debug!(
             read_bypass_request_context,
@@ -304,33 +311,72 @@ impl FileReadAheadState {
     ) -> Result<(Option<Bytes>, bool), ReadAheadCacheError> {
         self.validate_request(s3_data_locator)?;
 
-        // 1. Get what's cached (may be partial)
-        // Convert to owned bytes immediately to release any cache locks before S3 fetch,
-        // which may trigger eviction that needs write locks on the same entries.
-        let cached_data: Vec<(Range<u64>, Bytes)> = {
-            let data_cache = self.acquire_read_lock().await?;
-            let ranges = self.collect_cached_ranges(
+        // === STEP 1: Atomic planning
+        // Acquire WRITE lock on data_cache and do ALL planning atomically:
+        //   1a. Collect cached ranges (get Arc refs to existing loaded entries)
+        //   1b. Compute missing ranges (what we need to fetch from S3)
+        //   1c. Insert placeholders for missing (state=Loading, so other readers wait)
+        let (cached_ranges, missing_ranges, cached_data_objects, fetch_range) = {
+            let mut data_cache_write = self.acquire_write_lock().await?;
+
+            // 1a: What's already cached?
+            let cached_ranges = self.collect_cached_ranges(
                 &read_bypass_request_context,
                 range.clone(),
-                &data_cache,
+                &data_cache_write,
             )?;
-            drop(data_cache);
-            self.fetch_from_cached_ranges(&read_bypass_request_context, ranges, false)
-                .await?
-                .into_iter()
-                .map(|(r, b)| (r, Bytes::copy_from_slice(&b)))
-                .collect()
+
+            // 1b: What's missing? (includes readahead window)
+            let fetch_range = self.get_range_to_fetch(range.clone(), read_pattern, file_size);
+            let missing_ranges = self.get_missing_ranges(fetch_range.clone(), &data_cache_write)?;
+
+            // 1c: Insert placeholders for missing ranges while we still hold the lock
+            let mut cached_data_objects = Vec::new();
+            for (i, missing_range) in missing_ranges.iter().enumerate() {
+                let cached_data = Arc::new(CachedData::new());
+                cached_data_objects.push(cached_data.clone());
+
+                if !self.insert_range_with_guard(
+                    missing_range.clone(),
+                    cached_data,
+                    &mut data_cache_write,
+                )? {
+                    // Clean up placeholders from previous iterations
+                    for prev_range in &missing_ranges[..i] {
+                        data_cache_write.remove(&prev_range.start);
+                    }
+                    return Err(ReadAheadCacheError {
+                        message: format!("Failed to insert missing range: {:?}", missing_range),
+                    });
+                }
+            }
+
+            (cached_ranges, missing_ranges, cached_data_objects, fetch_range)
         };
 
-        // 2. Compute what's missing
-        let mut data_cache_write = self.acquire_write_lock().await?;
-        let fetch_range = self.get_range_to_fetch(range.clone(), read_pattern, file_size);
-        let fetch_end = fetch_range.end;
-        let missing_ranges = self.get_missing_ranges(fetch_range.clone(), &data_cache_write)?;
+        // === STEP 2: Read from cached Arc refs ===
+        // Acquire READ locks on each CachedData.data, copy bytes out.
+        // If evicted since planning, returns error - clean up placeholders first.
+        let cached_data: Vec<(Range<u64>, Bytes)> = match self
+            .fetch_from_cached_ranges(&read_bypass_request_context, cached_ranges, false)
+            .await
+        {
+            Ok(data) => data
+                .into_iter()
+                .map(|(r, b)| (r, Bytes::copy_from_slice(&b)))
+                .collect(),
+            Err(e) => {
+                // Clean up placeholders we inserted in Step 1
+                for missing_range in &missing_ranges {
+                    self.remove_failed_entry(missing_range.start, CacheEntryState::Failed)
+                        .await;
+                }
+                return Err(e);
+            }
+        };
 
-        // 3. If there is nothing missing then we can just return the data
+        // If nothing missing, return cached data
         if missing_ranges.is_empty() {
-            drop(data_cache_write);
             ctx_debug!(
                 read_bypass_request_context,
                 "fetch data from cache: start ({}) - end ({})",
@@ -343,7 +389,10 @@ impl FileReadAheadState {
             ));
         }
 
-        // 4. We need to fetch from S3 for what is missing, add place holders in the cache
+        // === STEP 3: Fetch from S3 for missing ranges ===
+        // For each placeholder we inserted, acquire WRITE lock on CachedData.data,
+        // fetch bytes from S3, store in placeholder, set state=Loaded.
+        let fetch_end = fetch_range.end;
         let readahead_bytes = fetch_end.saturating_sub(range.end);
         ctx_debug!(
             read_bypass_request_context,
@@ -358,27 +407,6 @@ impl FileReadAheadState {
             self.window_size.load(Ordering::SeqCst)
         );
 
-        let mut cached_data_objects = Vec::new();
-        for missing_range in &missing_ranges {
-            let cached_data = Arc::new(CachedData::new());
-            cached_data_objects.push(cached_data.clone());
-
-            if !self.insert_range_with_guard(
-                missing_range.clone(),
-                cached_data,
-                &mut data_cache_write,
-            )? {
-                let error = ReadAheadCacheError {
-                    message: format!("Failed to insert missing range: {:?}", missing_range),
-                };
-                ctx_error!(read_bypass_request_context, "{}", error);
-                return Err(error);
-            }
-        }
-
-        drop(data_cache_write);
-
-        // 5. Perform the fetch from S3
         let (s3_ranges, hit_memory_pressure) = self
             .fetch_missing_ranges_from_s3(
                 read_bypass_request_context.clone(),
@@ -399,7 +427,7 @@ impl FileReadAheadState {
             self.shrink_window();
         }
 
-        // 6. Combine what we had in cache and what was fetched to return
+        // === STEP 4: Combine cached + S3 data and return ===
         let mut all_ranges = cached_data;
         all_ranges.extend(s3_ranges);
         Ok((
@@ -709,18 +737,26 @@ impl FileReadAheadState {
 
         ranges.sort_by_key(|(r, _)| r.start);
 
-        // Validate contiguous coverage of expected range
+        // Validate contiguous coverage of expected range and detect overlaps
         let mut pos = expected.start;
         for (range, _) in &ranges {
             // Allow ranges that start before expected (will be trimmed)
             if range.end <= pos {
                 continue; // Range entirely before current position
             }
+            if range.start < pos && pos != expected.start {
+                return Err(ReadAheadCacheError {
+                    message: format!(
+                        "Overlapping ranges detected: current position {} but range starts at {} (range end: {})",
+                        pos, range.start, range.end
+                    ),
+                });
+            }
             if range.start > pos {
                 return Err(ReadAheadCacheError {
                     message: format!(
-                        "Gap in data at offset {}, next range starts at {}",
-                        pos, range.start
+                        "Gap in data at offset {}, next range starts at {} (expected end: {})",
+                        pos, range.start, expected.end
                     ),
                 });
             }
@@ -748,6 +784,20 @@ impl FileReadAheadState {
             let local_start = (overlap_start - range.start) as usize;
             let local_end = (overlap_end - range.start) as usize;
             result.extend_from_slice(&bytes[local_start..local_end]);
+        }
+
+        // Final sanity check - result must be exactly the expected size
+        if result.len() != expected_len {
+            return Err(ReadAheadCacheError {
+                message: format!(
+                    "Result size mismatch for range {}..{}: got {} bytes but expected {} \
+                    (possible overlap or gap in cached/fetched ranges)",
+                    expected.start,
+                    expected.end,
+                    result.len(),
+                    expected_len
+                ),
+            });
         }
 
         Ok(result.freeze())

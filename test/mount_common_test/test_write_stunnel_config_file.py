@@ -12,6 +12,7 @@ import efs_utils_common.constants as constants
 import efs_utils_common.context as context
 import efs_utils_common.platform_utils as platform_utils
 import efs_utils_common.proxy as proxy
+from efs_utils_common.constants import VERSION
 
 from .. import utils
 
@@ -213,6 +214,7 @@ def _get_expected_efs_config_tls(
         )
         expected_efs_config["fs_id"] = fs_id
         expected_efs_config["region"] = DEFAULT_REGION
+        expected_efs_config["efs_utils_version"] = VERSION
 
     if check_cert_hostname or efs_proxy_enabled:
         expected_efs_config["checkHost"] = dns_name[dns_name.index(fs_id) :]
@@ -252,6 +254,7 @@ def _get_expected_efs_config_non_tls(
     if efs_proxy_enabled:
         expected_efs_config["fs_id"] = fs_id
         expected_efs_config["region"] = DEFAULT_REGION
+        expected_efs_config["efs_utils_version"] = VERSION
 
     return expected_efs_config
 

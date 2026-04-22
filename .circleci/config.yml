@@ -199,13 +199,6 @@ commands:
           name: Check changelog
           command: |
             rpm -q --changelog amazon-efs-utils
-  build-centos-repo:
-    steps:
-      - run:
-          name: change the mirrors to vault.centos.org
-          command: |
-            sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
-            sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
 jobs:
   test:
     parameters:
@@ -247,12 +240,6 @@ workflows:
   workflow:
     jobs:
       - test:
-          name: python3_8
-          image: python:3.8.13
-      - test:
-          name: python3_9
-          image: python:3.9.13
-      - test:
           name: python3_10
           image: python:3.10.13
       - test:
@@ -261,6 +248,12 @@ workflows:
       - test:
           name: python3_12
           image: python:3.12.4
+      - test:
+          name: python3_13
+          image: python:3.13.12
+      - test:
+          name: python3_14
+          image: python:3.14.3
       - build-deb-package:
           name: ubuntu-latest
           image: ubuntu:latest

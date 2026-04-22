@@ -41,7 +41,7 @@
 %{?!include_vendor_tarball:%define include_vendor_tarball true}
 
 Name      : amazon-efs-utils
-Version   : 3.0.1
+Version   : 3.1.0
 Release   : 1%{platform}
 Summary   : This package provides utilities for simplifying the use of EFS file systems
 
@@ -215,6 +215,10 @@ fi
 %clean
 
 %changelog
+* Fri Apr 17 2026 Samuel Hale <samuhale@amazon.com> - 3.1.0
+- Enable readahead caching in proxy for bypassed reads
+- Clean up warnings in proxy
+
 * Wed Apr 08 2026 Yangjinan Hu <yjnhu@amazon.com> - 3.0.1
 - Fix proxy crash on NFS error in READ_BYPASS response
 

@@ -48,7 +48,12 @@ def get_dns_name_and_mount_target_ip_address(config, fs_id, options):
             expected_replacement_field_ct += 1
             format_args["az_id"] = az_id
         except RuntimeError:
-            err_msg = "Cannot retrieve AZ-ID from metadata service. This is required for S3Files mounts using {az_id} in dns_name_format."
+            err_msg = (
+                "Cannot retrieve AZ-ID from instance metadata service (IMDS). "
+                "Ensure IMDS is reachable and that the instance has the correct IAM permissions. "
+                "This is required for S3Files mounts using {az_id} in dns_name_format. "
+                "You can also specify the AZ ID directly using the mount option: -o azid=<az-id>."
+            )
             fatal_error(err_msg)
     region = None
     if "{region}" in dns_name_format:

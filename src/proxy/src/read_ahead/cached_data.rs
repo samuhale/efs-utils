@@ -21,6 +21,11 @@ pub const INVALID_U64: u64 = u64::MAX; // Used to indicate the value is unset
 const DEFAULT_TIME_OUT_SECOND: u64 = 15; // 15 secs - S3 deadline is 5s allows for a few retries
 const MAX_LOADING_TIME_MS: u64 = 30_000; // Double the timeout value, used to evict entries if they persist and aren't loaded
 
+/// State machine for cache entries:
+/// - Loading: Entry created, S3 fetch in progress. Readers wait on notify.
+/// - Loaded: Data available. Readers can access via read lock.
+/// - Failed: S3 fetch failed. Entry will be removed from index.
+/// - Evicted: Entry marked for removal. Data cleared, memory returned to pool.
 #[atomic_enum]
 #[derive(PartialEq, Eq)]
 pub enum CacheEntryState {
@@ -279,8 +284,13 @@ impl CachedData {
         // Fast path: single-chunk read — zero-copy via Bytes::from_owner.
         if fits_single_chunk {
             let guard = self.data.clone().read_owned().await;
+            // Re-check state after acquiring lock - eviction sets state before clearing data
+            if self.get_state() != CacheEntryState::Loaded {
+                return Err(ReadAheadCacheError {
+                    message: "Data evicted before read completed".to_string(),
+                });
+            }
             if guard.is_empty() {
-                // This shouldn't happen if state is Loaded, but handle defensively
                 return Err(ReadAheadCacheError {
                     message: "Cache entry has no data despite Loaded state".to_string(),
                 });
@@ -305,7 +315,12 @@ impl CachedData {
 
         // Slow path: multi-chunk read — copy into Vec
         let data_guard = self.acquire_read_lock().await?;
-
+        // Re-check state after acquiring lock - eviction sets state before clearing data
+        if self.get_state() != CacheEntryState::Loaded {
+            return Err(ReadAheadCacheError {
+                message: "Data evicted before read completed".to_string(),
+            });
+        }
         if data_guard.is_empty() {
             // This shouldn't happen if state is Loaded, but handle defensively
             return Err(ReadAheadCacheError {

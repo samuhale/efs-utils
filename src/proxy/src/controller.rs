@@ -4,7 +4,7 @@ use crate::{
         s3_client::S3ClientBuilder,
     },
     awsfile_prot::{
-        AwsFileChannelInitArgs, AwsFileReadBypassConfigArgs, ChannelConfigArgs, ScaleUpConfig,
+        AwsFileChannelInitArgs, AwsFileReadBypassConfigArgsV2, ChannelConfigArgs, ScaleUpConfig,
     },
     awsfile_rpc::{PartitionId, RpcClient},
     config::channel_init_config::ChannelInitConfig,
@@ -22,6 +22,10 @@ use log::{debug, error, info, warn};
 use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
+
+pub const METRICS_EMISSION_PERIOD: Duration = Duration::from_secs(60);
+
+pub const AWSFILE_CHANNEL_INIT_MINOR_VERSION: u32 = 2;
 
 pub const DEFAULT_SCALE_UP_BACKOFF: Duration = Duration::from_secs(300);
 
@@ -44,6 +48,14 @@ enum EventResult<S> {
     Ok,
 }
 
+/// Result of the proxy status loop, used to communicate back to the outer incarnation loop.
+pub(crate) enum StatusLoopResult<S> {
+    /// The proxy should restart with pre-established connections.
+    RestartWithConnections((Option<PartitionId>, Vec<S>, Option<ScaleUpConfig>)),
+    /// The proxy status loop exited normally (shutdown or error).
+    Break,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectionSearchState {
     SearchingAdditional(Option<PartitionId>),
@@ -51,7 +63,7 @@ pub enum ConnectionSearchState {
     Idle,
 }
 
-struct IncarnationState<S: ProxyStream> {
+pub(crate) struct IncarnationState<S: ProxyStream> {
     pub proxy_id: ProxyIdentifier,
     pub last_proxy_update: Option<(Instant, PerformanceStats)>,
     pub partition_id: Option<PartitionId>,
@@ -205,15 +217,21 @@ impl<S: ProxyStream> Controller<S> {
 
             // Add read bypass config if requested
             if self.proxy_config.nested_config.read_bypass_config.requested {
-                configs.push(ChannelConfigArgs::AWSFILE_READ_BYPASS(
-                    AwsFileReadBypassConfigArgs {
+                configs.push(ChannelConfigArgs::AWSFILE_READ_BYPASS_V2(
+                    AwsFileReadBypassConfigArgsV2 {
                         enabled: self.proxy_config.nested_config.read_bypass_config.enabled,
+                        efs_utils_version: self
+                            .proxy_config
+                            .nested_config
+                            .efs_utils_version
+                            .as_bytes()
+                            .to_vec(),
                     },
                 ));
             }
 
             let channel_init_args = AwsFileChannelInitArgs {
-                minor_version: 1,
+                minor_version: AWSFILE_CHANNEL_INIT_MINOR_VERSION,
                 configs,
             };
 
@@ -271,59 +289,19 @@ impl<S: ProxyStream> Controller<S> {
             )
             .await;
 
-            // Proxy status loop
-            let mut metrics_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + Duration::from_secs(60),
-                Duration::from_secs(60),
-            );
-            loop {
-                let mut err = Ok(());
-                tokio::select! {
-                    _ = metrics_interval.tick() => {
-                        let fs_id = self.proxy_config.nested_config.fs_id.as_str();
-                        self.emit_nfs_reachability(true, fs_id).await;
-                    }
-                    _ = self.status_reporter.await_report_request() => {
-                        let report = status_reporter::Report {
-                            proxy_id: state.proxy_id,
-                            partition_id: state.partition_id,
-                            connection_state: state.connection_state.clone(),
-                            num_connections: state.num_connections as usize,
-                            last_proxy_update: state.last_proxy_update,
-                            scale_up_attempt_count: self.scale_up_attempt_count,
-                            restart_count: self.restart_count
-                        };
-                        self.status_reporter.publish_status(report).await;
-                    }
-                    event = status_events_rx.recv() => {
-                        if let Some(next_event) = event {
-                            match self.handle_event(next_event, &mut proxy, &mut state, shutdown.clone()).await {
-                                Ok(EventResult::Restart(connections)) => {
-                                    debug!("Restarting proxy to use multiple connections");
-                                    ready_connections = Some(connections);
-                                    shutdown.exit(Some(ShutdownReason::NeedsRestart)).await;
-                                    break;
-                                },
-                                Ok(EventResult::Ok) => continue,
-                                Err(e) => err = Err(e),
-                            };
+            let status_loop_result = self
+                .run_proxy_status_loop(
+                    &mut proxy,
+                    &mut state,
+                    &mut status_events_rx,
+                    shutdown.clone(),
+                    METRICS_EMISSION_PERIOD,
+                )
+                .await;
 
-                        } else {
-                            err = Err("All senders have closed");
-                        }
-                    }
-                    _ = shutdown.cancellation_token.cancelled() => {
-                        debug!("Controller exiting due to child exit");
-                        break;
-                    }
-                    _ = self.listener.accept() => {
-                        warn!("Unexpected connection, ignoring")
-                    }
-                }
-                if err.is_err() {
-                    info!("Starting proxy restart due to {}", err.unwrap_err());
-                    break;
-                }
+            if let StatusLoopResult::RestartWithConnections(connections) = status_loop_result {
+                ready_connections = Some(connections);
+                shutdown.exit(Some(ShutdownReason::NeedsRestart)).await;
             }
 
             if let Some(count) = self.restart_count.checked_add(1) {
@@ -349,6 +327,67 @@ impl<S: ProxyStream> Controller<S> {
                 reason => return reason,
             }
         }
+    }
+
+    pub(crate) async fn run_proxy_status_loop(
+        &mut self,
+        proxy: &mut Proxy<S>,
+        state: &mut IncarnationState<S>,
+        status_events_rx: &mut mpsc::Receiver<Event<S>>,
+        shutdown: ShutdownHandle,
+        metrics_emission_period: Duration,
+    ) -> StatusLoopResult<S> {
+        let mut metrics_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + metrics_emission_period,
+            metrics_emission_period,
+        );
+        loop {
+            let mut err = Ok(());
+            tokio::select! {
+                _ = metrics_interval.tick() => {
+                    let fs_id = self.proxy_config.nested_config.fs_id.as_str();
+                    self.emit_nfs_reachability(true, fs_id).await;
+                }
+                _ = self.status_reporter.await_report_request() => {
+                    let report = status_reporter::Report {
+                        proxy_id: state.proxy_id,
+                        partition_id: state.partition_id,
+                        connection_state: state.connection_state.clone(),
+                        num_connections: state.num_connections as usize,
+                        last_proxy_update: state.last_proxy_update,
+                        scale_up_attempt_count: self.scale_up_attempt_count,
+                        restart_count: self.restart_count
+                    };
+                    self.status_reporter.publish_status(report).await;
+                }
+                event = status_events_rx.recv() => {
+                    if let Some(next_event) = event {
+                        match self.handle_event(next_event, proxy, state, shutdown.clone()).await {
+                            Ok(EventResult::Restart(connections)) => {
+                                debug!("Restarting proxy to use multiple connections");
+                                return StatusLoopResult::RestartWithConnections(connections);
+                            },
+                            Ok(EventResult::Ok) => continue,
+                            Err(e) => err = Err(e),
+                        };
+                    } else {
+                        err = Err("All senders have closed");
+                    }
+                }
+                _ = shutdown.cancellation_token.cancelled() => {
+                    debug!("Controller exiting due to child exit");
+                    break;
+                }
+                _ = self.listener.accept() => {
+                    warn!("Unexpected connection, ignoring")
+                }
+            }
+            if err.is_err() {
+                info!("Starting proxy restart due to {}", err.unwrap_err());
+                break;
+            }
+        }
+        StatusLoopResult::Break
     }
 
     fn should_scale_up(&self, state: &mut IncarnationState<S>, stats: PerformanceStats) -> bool {
@@ -448,5 +487,166 @@ impl<S: ProxyStream> Controller<S> {
             publisher.emit_log(level, &message);
             publisher.publish_nfs_reachability(is_reachable, fs_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        aws::cw_publisher::LogLevel,
+        config::channel_init_config::ChannelInitConfig,
+        proxy_builder::ProxyBuilder,
+        status_reporter::create_status_channel,
+    };
+    use std::sync::atomic::AtomicU64;
+    use tokio::net::TcpStream;
+    use tokio_util::sync::CancellationToken;
+
+    struct MockCloudWatchClient {
+        nfs_reachability_calls: AtomicU64,
+    }
+
+    impl MockCloudWatchClient {
+        fn new() -> Self {
+            Self {
+                nfs_reachability_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn nfs_reachability_call_count(&self) -> u64 {
+            self.nfs_reachability_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CloudWatchClient for MockCloudWatchClient {
+        fn emit_log(&self, _level: LogLevel, _message: &str) {}
+        fn publish_s3_reachable(&self, _bucket: &str, _is_reachable: bool) {}
+        fn publish_s3_permitted(&self, _bucket: &str, _is_permitted: bool) {}
+        fn publish_nfs_reachability(&self, _is_reachable: bool, _fs_id: &str) {
+            self.nfs_reachability_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct MockPartitionFinder;
+
+    #[async_trait::async_trait]
+    impl PartitionFinder<TcpStream> for MockPartitionFinder {
+        async fn create_connect_future(
+            &self,
+        ) -> futures::future::BoxFuture<'static, Result<TcpStream, crate::error::ConnectError>>
+        {
+            unimplemented!()
+        }
+    }
+
+    async fn create_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn test_status_loop_emits_nfs_reachability_every_minute() {
+        let mock_publisher = Arc::new(MockCloudWatchClient::new());
+        let (_status_requester, status_reporter) = create_status_channel();
+
+        let controller_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.nested_config.fs_id = "fs-test123".to_string();
+
+        let mut controller = Controller::<TcpStream> {
+            listener: controller_listener,
+            partition_finder: Arc::new(MockPartitionFinder),
+            proxy_id: ProxyIdentifier::new(),
+            scale_up_attempt_count: 0,
+            restart_count: 0,
+            scale_up_config: DEFAULT_SCALE_UP_CONFIG,
+            status_reporter,
+            proxy_config: proxy_config.clone(),
+            cw_publisher: Some(mock_publisher.clone()),
+        };
+
+        // Build a minimal proxy
+        let (nfs_client, _nfs_server) = create_tcp_pair().await;
+        let (_efs_client, efs_server) = create_tcp_pair().await;
+        let (events_tx, mut events_rx) = mpsc::channel(1024);
+        let token = CancellationToken::new();
+        let (shutdown, _waiter) = ShutdownHandle::new(token.clone());
+
+        let mut proxy = ProxyBuilder::<TcpStream>::build_proxy(
+            nfs_client,
+            vec![efs_server],
+            events_tx.clone(),
+            shutdown.clone(),
+            proxy_config,
+            ChannelInitConfig::default(),
+            None,
+        )
+        .await;
+
+        let mut state = IncarnationState::new(
+            ProxyIdentifier::new(),
+            None,
+            events_tx,
+            1,
+        );
+
+        let period_secs = 10;
+        let publisher_clone = mock_publisher.clone();
+        let cancel_token = token.clone();
+
+        tokio::time::pause();
+
+        let handle = tokio::spawn(async move {
+            controller
+                .run_proxy_status_loop(
+                    &mut proxy,
+                    &mut state,
+                    &mut events_rx,
+                    shutdown,
+                    Duration::from_secs(period_secs),
+                )
+                .await;
+            proxy
+        });
+
+        // Let the spawned task start polling
+        tokio::task::yield_now().await;
+
+        // First tick
+        tokio::time::advance(Duration::from_secs(period_secs)).await;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(publisher_clone.nfs_reachability_call_count(), 1);
+
+        // Second tick
+        tokio::time::advance(Duration::from_secs(period_secs)).await;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(publisher_clone.nfs_reachability_call_count(), 2);
+
+        // Third tick
+        tokio::time::advance(Duration::from_secs(period_secs)).await;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(publisher_clone.nfs_reachability_call_count(), 3);
+
+        cancel_token.cancel();
+        tokio::time::resume();
+
+        let proxy = handle.await.unwrap();
+        let _ = proxy.shutdown().await;
     }
 }

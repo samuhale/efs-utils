@@ -984,8 +984,8 @@ mod tests {
         );
     }
 
-    /// Stress test for concurrent reads with cache eviction pressure.
-    #[ignore]
+    /// Stress test for concurrent reads with cache eviction pressure
+    /// to verify no race conditions between eviction and cache operations.
     #[test_case(false, false ; "single_file_random")]
     #[test_case(false, true ; "single_file_sequential")]
     #[test_case(true, false ; "multi_file_random")]

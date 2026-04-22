@@ -48,6 +48,7 @@ from efs_utils_common.constants import (
     PROXY_CONFIG_SECTION,
     SKIP_NO_SO_BINDTODEVICE_RELEASES,
     STATE_FILE_DIR,
+    VERSION,
     WATCHDOG_SERVICE,
     WATCHDOG_SERVICE_PLIST_PATH,
 )
@@ -293,7 +294,11 @@ def write_stunnel_config_file(
         global_config["socket"].remove("a:SO_BINDTODEVICE=lo")
 
     stunnel_debug_enabled = get_boolean_config_item_value(
-        config, CONFIG_SECTION, "stunnel_debug_enabled", default_value=False
+        config,
+        CONFIG_SECTION,
+        "stunnel_debug_enabled",
+        default_value=False,
+        emit_warning_message=(MountContext().mount_type != MOUNT_TYPE_S3FILES),
     )
     if stunnel_debug_enabled:
         global_config["debug"] = "debug"
@@ -415,6 +420,7 @@ def write_stunnel_config_file(
         set_telemetry_config(efs_config, config)
         efs_config["fs_id"] = fs_id
         efs_config["region"] = region
+        efs_config["efs_utils_version"] = VERSION
 
     stunnel_config = "\n".join(
         serialize_stunnel_config(global_config)
